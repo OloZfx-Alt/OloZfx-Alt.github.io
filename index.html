@@ -706,8 +706,10 @@ button:disabled{opacity:.5;cursor:default}
         waitPanel.style.display = 'none';
         desktop.style.display = 'flex';
         status('Connecté et chiffré', true);
-      } else if (message.type === 'frame' && typeof message.jpeg === 'string') {
-        drawFrame(message.jpeg);
+      } else if (message.type === 'grid') {
+        applyTileGrid(message);
+      } else if (message.type === 'tiles' && Array.isArray(message.tiles)) {
+        queueTiles(message.tiles);
       } else if (message.type === 'rejected') {
         await disconnect(false);
         error('La connexion a été refusée sur le Mac.');
@@ -841,64 +843,129 @@ button:disabled{opacity:.5;cursor:default}
     }
   }
 
-  // Une seule image est décodée à la fois. Si une nouvelle image arrive pendant le décodage,
-  // elle remplace la précédente : on affiche toujours la plus récente, sans limite artificielle de cadence.
-  let pendingFrame = null;
-  let decodingFrame = false;
-  let frameCount = 0;
-  let lastFrameBytes = 0;
-  let statsSince = performance.now();
+  // Grille annoncée par le Mac au début de la session. Une tuile n'est redessinée que lorsque le Mac
+  // l'envoie, c'est-à-dire quand son contenu change : les tuiles immobiles restent affichées sans être renvoyées.
+  let tileGrid = null;
+  const pendingTiles = new Map();   // "colonne,ligne" -> { mime, data } ; seule la plus récente est conservée
+  let tilesDrawing = false;
+  let tileCount = 0;
+  let tileBytes = 0;
+  let tileStatsSince = performance.now();
+  let lastResyncAt = -Infinity;
 
-  function decodeJpeg(blob) {
-    if (typeof window.createImageBitmap === 'function') return window.createImageBitmap(blob);
+  function applyTileGrid(grid) {
+    const valid = [grid && grid.tile, grid && grid.columns, grid && grid.rows]
+      .every(value => Number.isInteger(value) && value > 0);
+    if (!valid) {
+      journal('erreur', 'Grille invalide reçue du Mac.');
+      return;
+    }
+    tileGrid = {
+      tile: grid.tile,
+      columns: grid.columns,
+      rows: grid.rows,
+      width: grid.columns * grid.tile,
+      height: grid.rows * grid.tile
+    };
+    canvas.width = tileGrid.width;
+    canvas.height = tileGrid.height;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    pendingTiles.clear();
+    journal('grille', tileGrid.columns + ' × ' + tileGrid.rows + ' tuiles de ' + tileGrid.tile + ' px (' + tileGrid.width + ' × ' + tileGrid.height + ' px)');
+  }
+
+  function decodeTile(bytes, mime) {
+    if (typeof window.createImageBitmap === 'function') {
+      return window.createImageBitmap(new Blob([bytes], { type: mime }));
+    }
     return new Promise((resolve, reject) => {
-      const url = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
       const image = new Image();
       image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
-      image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('décodage JPEG impossible')); };
+      image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('décodage impossible')); };
       image.src = url;
     });
   }
 
-  async function decodeNextFrame() {
-    decodingFrame = true;
-    try {
-      while (pendingFrame) {
-        const base64 = pendingFrame;
-        pendingFrame = null;
-        const bytes = b64ToBytes(base64);
-        lastFrameBytes = bytes.length;
-        const bitmap = await decodeJpeg(new Blob([bytes], { type: 'image/jpeg' }));
-        const width = bitmap.width || bitmap.naturalWidth;
-        const height = bitmap.height || bitmap.naturalHeight;
-        if (canvas.width !== width || canvas.height !== height) {
-          canvas.width = width;
-          canvas.height = height;
-        }
-        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        if (typeof bitmap.close === 'function') bitmap.close();
-        frameCount++;
+  function requestResync(reason) {
+    const now = performance.now();
+    if (now - lastResyncAt < 2000) return;
+    lastResyncAt = now;
+    journal('resync', reason + ' — demande d’une image complète au Mac');
+    sendSecure({ type: 'resync' });
+  }
+
+  function queueTiles(tiles) {
+    if (!tileGrid) {
+      requestResync('tuiles reçues avant la grille');
+      return;
+    }
+    for (const tile of tiles) {
+      if (!tile || !Number.isInteger(tile.c) || !Number.isInteger(tile.r) || typeof tile.d !== 'string') continue;
+      const mime = tile.f === 'p' ? 'image/png' : 'image/jpeg';
+      if (tile.c === -1 && tile.r === -1) {
+        // Image entière : elle remplace tout ce qui est en attente, et les tuiles suivantes viendront après.
+        pendingTiles.clear();
+        pendingTiles.set('full', { mime, data: tile.d });
+        continue;
       }
-    } catch (failure) {
-      journal('erreur', 'Image non décodée : ' + (failure.message || failure));
+      if (tile.c < 0 || tile.c >= tileGrid.columns || tile.r < 0 || tile.r >= tileGrid.rows) continue;
+      pendingTiles.set(tile.c + ',' + tile.r, { mime, data: tile.d });
+    }
+    drawPendingTiles();
+  }
+
+  // Une tuile en attente est remplacée par une version plus récente avant d'être décodée,
+  // mais aucune tuile n'est jamais abandonnée : toutes les mises à jour finissent à l'écran.
+  async function drawPendingTiles() {
+    if (tilesDrawing) return;
+    tilesDrawing = true;
+    try {
+      while (pendingTiles.size > 0) {
+        const grid = tileGrid;
+        const batch = Array.from(pendingTiles);
+        pendingTiles.clear();
+        const results = await Promise.all(batch.map(async ([key, tile]) => {
+          try {
+            tileBytes += Math.ceil(tile.data.length * 0.75);
+            return { key, bitmap: await decodeTile(b64ToBytes(tile.data), tile.mime) };
+          } catch (failure) {
+            return { key, failure: failure.message || String(failure) };
+          }
+        }));
+        let failed = false;
+        for (const result of results) {
+          if (result.failure) {
+            failed = true;
+            journal('erreur', 'Tuile ' + result.key + ' non décodée : ' + result.failure);
+            continue;
+          }
+          if (result.key === 'full') {
+            ctx.drawImage(result.bitmap, 0, 0, canvas.width, canvas.height);
+          } else {
+            const [column, row] = result.key.split(',').map(Number);
+            ctx.drawImage(result.bitmap, column * grid.tile, row * grid.tile, grid.tile, grid.tile);
+          }
+          if (typeof result.bitmap.close === 'function') result.bitmap.close();
+          tileCount++;
+        }
+        if (failed) requestResync('tuile illisible');
+      }
     } finally {
-      decodingFrame = false;
+      tilesDrawing = false;
     }
   }
 
-  function drawFrame(base64) {
-    pendingFrame = base64;
-    if (!decodingFrame) decodeNextFrame();
-  }
-
-  // Compteur de fréquence, écrit dans le journal : il permet de mesurer le gain réel.
+  // Compteur écrit dans le journal toutes les 5 secondes : nombre de tuiles reçues et débit approximatif.
   setInterval(() => {
-    const seconds = (performance.now() - statsSince) / 1000;
-    if (frameCount > 0) {
-      journal('vidéo', (frameCount / seconds).toFixed(1) + ' images/s · dernière image ' + Math.round(lastFrameBytes / 1024) + ' Ko');
+    const seconds = (performance.now() - tileStatsSince) / 1000;
+    if (tileCount > 0) {
+      journal('vidéo', (tileCount / seconds).toFixed(0) + ' tuiles/s · ' + Math.round(tileBytes / 1024 / seconds) + ' Ko/s reçus');
     }
-    frameCount = 0;
-    statsSince = performance.now();
+    tileCount = 0;
+    tileBytes = 0;
+    tileStatsSince = performance.now();
   }, 5000);
 
   function pointFromEvent(event) {
