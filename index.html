@@ -251,7 +251,6 @@ button:disabled{opacity:.5;cursor:default}
   let startPoint = null;
   let twoFingerCenter = null;
   let lastMoveSent = 0;
-  let lastFrameAt = 0;
 
   function journal(level, text) {
     if (typeof window.__remoteLog === 'function') window.__remoteLog(level, text);
@@ -269,7 +268,7 @@ button:disabled{opacity:.5;cursor:default}
   const PEERJS_SOURCES = [];
   const PEER_OPTIONS = {
     host: "0.peerjs.com", port: 443, path: "/", secure: true,
-    config: ICE, debug: 2
+    config: ICE, debug: 3
   };
 
   function checkBrowserCapabilities() {
@@ -842,20 +841,65 @@ button:disabled{opacity:.5;cursor:default}
     }
   }
 
-  function drawFrame(base64) {
-    const now = performance.now();
-    if (now - lastFrameAt < 80) return;
-    lastFrameAt = now;
-    const image = new Image();
-    image.onload = () => {
-      if (canvas.width !== image.naturalWidth || canvas.height !== image.naturalHeight) {
-        canvas.width = image.naturalWidth;
-        canvas.height = image.naturalHeight;
-      }
-      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-    };
-    image.src = 'data:image/jpeg;base64,' + base64;
+  // Une seule image est décodée à la fois. Si une nouvelle image arrive pendant le décodage,
+  // elle remplace la précédente : on affiche toujours la plus récente, sans limite artificielle de cadence.
+  let pendingFrame = null;
+  let decodingFrame = false;
+  let frameCount = 0;
+  let lastFrameBytes = 0;
+  let statsSince = performance.now();
+
+  function decodeJpeg(blob) {
+    if (typeof window.createImageBitmap === 'function') return window.createImageBitmap(blob);
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+      image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('décodage JPEG impossible')); };
+      image.src = url;
+    });
   }
+
+  async function decodeNextFrame() {
+    decodingFrame = true;
+    try {
+      while (pendingFrame) {
+        const base64 = pendingFrame;
+        pendingFrame = null;
+        const bytes = b64ToBytes(base64);
+        lastFrameBytes = bytes.length;
+        const bitmap = await decodeJpeg(new Blob([bytes], { type: 'image/jpeg' }));
+        const width = bitmap.width || bitmap.naturalWidth;
+        const height = bitmap.height || bitmap.naturalHeight;
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        if (typeof bitmap.close === 'function') bitmap.close();
+        frameCount++;
+      }
+    } catch (failure) {
+      journal('erreur', 'Image non décodée : ' + (failure.message || failure));
+    } finally {
+      decodingFrame = false;
+    }
+  }
+
+  function drawFrame(base64) {
+    pendingFrame = base64;
+    if (!decodingFrame) decodeNextFrame();
+  }
+
+  // Compteur de fréquence, écrit dans le journal : il permet de mesurer le gain réel.
+  setInterval(() => {
+    const seconds = (performance.now() - statsSince) / 1000;
+    if (frameCount > 0) {
+      journal('vidéo', (frameCount / seconds).toFixed(1) + ' images/s · dernière image ' + Math.round(lastFrameBytes / 1024) + ' Ko');
+    }
+    frameCount = 0;
+    statsSince = performance.now();
+  }, 5000);
 
   function pointFromEvent(event) {
     const rect = canvas.getBoundingClientRect();
